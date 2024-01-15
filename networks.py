@@ -1,358 +1,280 @@
-import torch 
-import torch.nn as nn 
-import torch.nn.functional as F 
-from . import backbone
-from modules import SEU, SER, SE_Block, get_pad, ResnetBlock, RN_B
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import torch.nn.utils.spectral_norm as spectral_norm
 from utils import tensor_correlation, standard_scale, norm
 from torchvision import models
+from collections import OrderedDict
+from torch.autograd import Variable
+import torchvision.transforms as transforms
+import math
+from timm.models.layers import trunc_normal_
 
-    
-class STIIN(nn.Module):
-    def __init__(self, args):
-        super(STIIN, self).__init__()
-        self.out_dim = args.out_dim
-        self.cnum = 64  # Minimum mediate feature dimension 
-        self.T_middle_num = 3
-        self.S_middle_num = 3
-        self.temperature = args.temperature
-        self.K = args.K_train
-        
-        self.adversarial_loss = AdversarialLoss('nsgan')
-        
-        self.classifier256 = nn.Linear(self.cnum, self.K, bias=False)
-        self.classifier128 = nn.Linear(2 * self.cnum, self.K, bias=False)
-        self.classifier64 = nn.Linear(4 * self.cnum, self.K, bias=False)
-        
-        # Fixed classification header parameters
-        self.classifier64.weight.requires_grad  = False
-        self.classifier128.weight.requires_grad = False
-        self.classifier256.weight.requires_grad = False
-    
-        self.SE_encoder = nn.Sequential(
-            SE_Block(3 + self.K + 1, self.cnum, kernel_size = 5, stride = 1),
-            SE_Block(self.cnum, 2 * self.cnum, kernel_size = 3, stride = 2),
-            SE_Block(2 * self.cnum, 4 * self.cnum, kernel_size = 3, stride = 2))
-        
-        ## input 4x256x256
-        self.T_encoder1 = nn.Sequential(
-        nn.ReflectionPad2d(3),
-        nn.Conv2d(in_channels=4, out_channels=self.cnum, kernel_size=7, padding=0))
-        self.T_encoder1_rn = RN_B(feature_channels=self.cnum)
-        self.T_encoder1_relu = nn.ReLU(True)
-        
-        self.T_encoder2 = nn.Conv2d(in_channels=self.cnum, out_channels=2 * self.cnum, kernel_size=4, stride=2, padding=1)   
-        self.T_encoder2_rn = RN_B(feature_channels=2 * self.cnum)
-        self.T_encoder2_relu = nn.ReLU(True)
-        
-        self.T_encoder3 = nn.Conv2d(in_channels=2 * self.cnum, out_channels=4 * self.cnum, kernel_size=4, stride=2, padding=1)
-        self.T_encoder3_rn = RN_B(feature_channels=4 * self.cnum)
-        self.T_encoder3_relu = nn.ReLU(True)
-        
-        self.T_Rse = nn.Sequential(
-            ResnetBlock(256, dilation=1, use_spectral_norm=False),
-            ResnetBlock(256, dilation=1, use_spectral_norm=False),
-            ResnetBlock(256, dilation=1, use_spectral_norm=False),
-            ResnetBlock(256, dilation=1, use_spectral_norm=False))
-        
-        #### Bottleneck layers ####
-        ## Visual Bottleneck Layers
-        for i in range(1, self.T_middle_num + 1):
-            name = 'T_middle_{:d}'.format(i)
-            setattr(self, name, IMU(f_in = 4 * self.cnum, layout_dim = self.K, f_out = 4 * self.cnum)) # 256, 64
 
-        ## Semantic Bottleneck Layers
-        for i in range(1, self.S_middle_num + 1):
-            name = 'S_middle_{:d}'.format(i)
-            setattr(self, name, SEU(4 * self.cnum, 4 * self.cnum, 4 * self.cnum)) # 256, 64
-        
-        ## upsample for 128 x 128
-        self.up = nn.Upsample(scale_factor=2)     
-        self.T_res_decoder2 = nn.Sequential(
-            nn.Conv2d(self.K + 4 * self.cnum + 2 * self.cnum, 4 * self.cnum, kernel_size=1, stride=1, padding=get_pad(128, 1, 1)),
-            nn.LeakyReLU(0.2))
-        self.SE_up2 = nn.Sequential(
-            nn.Conv2d(4 * self.cnum, 2 * self.cnum, kernel_size=3, padding=get_pad(128, 3, 1)),
-            nn.LeakyReLU(0.2))
-        self.T_decoder2 = IMU(f_in = 4 * self.cnum, layout_dim = self.K, f_out = 2 * self.cnum, if_2spade = False)
-        
-        ## upsample for 256 x 256
-        self.T_res_decoder1 = nn.Sequential(
-            nn.Conv2d(self.K + 2 * self.cnum + self.cnum, 2 * self.cnum, kernel_size=1, stride=1, padding=get_pad(256, 1, 1)),
-            nn.LeakyReLU(0.2))
-        self.SE_up1 = nn.Sequential(
-            nn.Conv2d(2 * self.cnum, self.cnum, kernel_size=3, padding=get_pad(256, 3, 1)),
-            nn.LeakyReLU(0.2))
-        self.T_decoder1 = IMU(f_in = 2 * self.cnum, layout_dim = self.K, f_out = self.cnum, if_2spade = False)
-        
-        self.out = nn.Sequential(
-        nn.Conv2d(self.cnum, 3, 3, 1, 1, bias = False),
-        nn.Tanh())
-    
-    
-    def forward(self, masked_image, masked_label_list, masks_list):
-        masked_label_64 = masked_label_list[0]
-        masked_label_128 = masked_label_list[1]
-        masked_label_256 = masked_label_list[2]
-        
-        mask_64 = masks_list[0]
-        mask_128 = masks_list[1]
-        mask_256 = masks_list[2]
-        
-        s_fea = self.SE_encoder(torch.cat((masked_image, masked_label_256, mask_256), dim = 1))
-        label_64_0 = torch.softmax(self.classifier64\
-                    (F.normalize(s_fea, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        
-        t_en1 = self.T_encoder1(torch.cat((masked_image, mask_256), dim = 1))
-        t_en1 = self.T_encoder1_rn(t_en1, mask_256)
-        t_en1 = self.T_encoder1_relu(t_en1)
-        
-        t_en2 = self.T_encoder2(t_en1)
-        t_en2 = self.T_encoder2_rn(t_en2, mask_256)
-        t_en2 = self.T_encoder2_relu(t_en2)
-        
-        t_en3 = self.T_encoder3(t_en2)
-        t_en3 = self.T_encoder3_rn(t_en3, mask_256)
-        t_en3 = self.T_encoder3_relu(t_en3)
-        
-        t_at  = self.T_Rse(t_en3) # 256x64x64
-            
-            
-        ##  Multi-level Interactive
-        _label_64_0 = masked_label_64 * mask_64 + label_64_0 * (1 - mask_64) 
-        t_m2 = self.T_middle_1(t_at, _label_64_0, mask_64)
-        s_m2 = self.S_middle_1(t_m2, s_fea, _label_64_0)
-        label_64_1 = torch.softmax(self.classifier64\
-                    (F.normalize(s_m2, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        
-        
-        _label_64_1 = masked_label_64 * mask_64 + label_64_1 * (1 - mask_64)
-        t_m3 = self.T_middle_2(t_m2, _label_64_1, mask_64)
-        s_m3 = self.S_middle_2(t_m3, s_m2, _label_64_1)
-        label_64_2 = torch.softmax(self.classifier64\
-                    (F.normalize(s_m3, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        
-        _label_64_2 = masked_label_64 * mask_64 + label_64_2 * (1 - mask_64)
-        t_m4 = self.T_middle_3(t_m3, _label_64_2, mask_64)
-        s_m4 = self.S_middle_3(t_m4, s_m3, _label_64_2)
-        label_64_3 = torch.softmax(self.classifier64\
-                    (F.normalize(s_m4, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        
-        ## Upsampleing
-        label_up2 = self.up(label_64_3)
-        label_128 = masked_label_128 * mask_128 + label_up2 * (1 - mask_128)
-        t_up2 = self.up(t_m4)
-        t_fea_up2 = self.T_res_decoder2(torch.cat((label_128, t_up2, t_en2), dim = 1))
-        s_fea_up2 = self.SE_up2(t_fea_up2)
-        label_128 = torch.softmax(self.classifier128\
-                    (F.normalize(s_fea_up2, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        _label_128 = masked_label_128 * mask_128 + label_128 * (1 - mask_128)
-        t_up2 = self.T_decoder2(t_fea_up2, label_128)
-        
-        label_up1 = self.up(label_128)
-        label_256 = masked_label_256 * mask_256 + label_up1 * (1 - mask_256)
-        t_up1 = self.up(t_up2)
-        t_fea_up1 = self.T_res_decoder1(torch.cat((label_256, t_up1, t_en1), dim = 1))
-        s_fea_up1 = self.SE_up1(t_fea_up1)
-        label_256 = torch.softmax(self.classifier256\
-                    (F.normalize(s_fea_up1, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        _label_256 = masked_label_256 * mask_256 + label_256 * (1 - mask_256)
-        t_up1 = self.T_decoder1(t_fea_up1, label_256)
-        
-        out = self.out(t_up1)
-        return [label_64_0, label_64_1, label_64_2, label_64_3, label_128, label_256], out
-    
-       
-class SPE(nn.Module):
-    def __init__(self, args):
-        super(SPE, self).__init__()
-        self.cnum = 64  # Minimum mediate feature dimension 
-        self.temperature = args.temperature
-        self.K = args.K_train
-        
-        vgg19 = models.vgg19(pretrained=True)
-        self.SE_encoder256 = nn.Sequential(*vgg19.features[:4])
-        self.SE_encoder128 = nn.Sequential(*vgg19.features[4:9])
-        self.SE_encoder64  = nn.Sequential(*vgg19.features[9:18])
-        
-        self.T_encoder256 = nn.Sequential(
-            nn.Conv2d(3, self.cnum, kernel_size=3, stride=1, padding=get_pad(256, 3, 1)),
-            nn.ReLU(),
-            nn.Conv2d(self.cnum, self.cnum, kernel_size=3, stride=1, padding=get_pad(256, 3, 1)),
-            nn.ReLU())
-        
-        self.T_encoder128 = nn.Sequential(
-            nn.Conv2d(self.cnum, 2 * self.cnum, kernel_size=3, stride=2, padding=get_pad(128, 3, 1)),
-            nn.ReLU(),
-            nn.Conv2d(2 * self.cnum, 2 * self.cnum, kernel_size=3, stride=1, padding=get_pad(128, 3, 1)),
-            nn.ReLU())
-        
-        self.T_encoder64 = nn.Sequential(
-            nn.Conv2d(2 * self.cnum, 4 * self.cnum, kernel_size=3, stride=2, padding=get_pad(64, 3, 1)),
-            nn.ReLU(),
-            nn.Conv2d(4 * self.cnum, 4 * self.cnum, kernel_size=3, stride=1, padding=get_pad(64, 3, 1)),
-            nn.ReLU())
-        
-        self.head1 = nn.Conv2d(self.cnum, 3, kernel_size=3, stride=1, padding=get_pad(256, 3, 1)) 
-        self.head2 = nn.Conv2d(2 * self.cnum, 3, kernel_size=3, stride=1, padding=get_pad(128, 3, 1))  
-        self.head3 = nn.Conv2d(4 * self.cnum, 3, kernel_size=3, stride=1, padding=get_pad(64, 3, 1))     
-        
-        for param in self.SE_encoder256.parameters():
-            param.requires_grad = False
-        for param in self.SE_encoder128.parameters():
-            param.requires_grad = False
-        for param in self.SE_encoder64.parameters():
-            param.requires_grad = False
-        
-        self.nonlinear_clusterer256 = nn.Sequential(
-            nn.Conv2d(self.cnum + self.cnum, self.cnum, kernel_size=3, padding=get_pad(256, 3, 1)),
-            nn.ReLU(),
-            nn.Conv2d(self.cnum, self.cnum, kernel_size=3, padding=get_pad(256, 3, 1)))
-        self.classifier256 = nn.Linear(self.cnum, self.K, bias=False)
-        
-        self.nonlinear_clusterer128 = nn.Sequential(
-            nn.Conv2d(2 * self.cnum + 2 * self.cnum, 2 * self.cnum, kernel_size=3, padding=get_pad(128, 3, 1)),
-            nn.ReLU(),
-            nn.Conv2d(2 * self.cnum, 2 * self.cnum, kernel_size=3, padding=get_pad(128, 3, 1)))
-        self.classifier128 = nn.Linear(2 * self.cnum, self.K, bias=False)
-        
-        self.nonlinear_clusterer64 = nn.Sequential(
-            nn.Conv2d(4 * self.cnum + 4 * self.cnum, 4 * self.cnum, kernel_size=3, padding=get_pad(64, 3, 1)),
-            nn.ReLU(),
-            nn.Conv2d(4 * self.cnum, 4 * self.cnum, kernel_size=3, padding=get_pad(64, 3, 1)))
-        self.classifier64 = nn.Linear(4 * self.cnum, self.K, bias=False)
-        
-        self.classifier64.weight.requires_grad  = False
-        self.classifier128.weight.requires_grad = False
-        self.classifier256.weight.requires_grad = False
-        
-        
-    def forward(self, image256):
-        sf_fea256 = self.SE_encoder256(image256).detach()
-        sf_fea128 = self.SE_encoder128(sf_fea256).detach()
-        sf_fea64  = self.SE_encoder64(sf_fea128).detach()
+class SPADE(nn.Module):
+    def __init__(self, norm_nc, label_nc):
+        super().__init__()
+        self.param_free_norm = nn.InstanceNorm2d(norm_nc, affine=False, track_running_stats=False)
+        nhidden = 128
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        self.mlp_gamma = nn.Conv2d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv2d(nhidden, norm_nc, kernel_size=3, padding=1)
 
-        tf_fea256 = self.SE_encoder256(image256).detach()
-        tf_fea128 = self.SE_encoder128(tf_fea256).detach()
-        tf_fea64  = self.SE_encoder64(tf_fea128).detach()
-        
-        out1 = self.head1(tf_fea256)
-        out2 = self.head2(tf_fea128)
-        out3 = self.head3(tf_fea64)
-        
-        f_fea256 = torch.cat((sf_fea256, tf_fea256), dim = 1)
-        f_fea128 = torch.cat((sf_fea128, tf_fea128), dim = 1)
-        f_fea64  = torch.cat((sf_fea64, tf_fea64), dim = 1)
-        
-        s_fea256 = self.nonlinear_clusterer256(f_fea256)
-        s_fea128 = self.nonlinear_clusterer128(f_fea128)
-        s_fea64  = self.nonlinear_clusterer64(f_fea64)
-        
-        label256 = torch.softmax(self.classifier256\
-                    (F.normalize(s_fea256, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        label128 = torch.softmax(self.classifier128\
-                    (F.normalize(s_fea128, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
-        label64  = torch.softmax(self.classifier64\
-                    (F.normalize(s_fea64, dim=1).permute(0,2,3,1)).permute(0,3,1,2).contiguous()/self.temperature, dim = 1)
+    def forward(self, x, segmap):
+        normalized = self.param_free_norm(x)
+        segmap = F.interpolate(segmap, size=x.size()[2:], mode='nearest')
+        actv = self.mlp_shared(segmap)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+        out = normalized * (1 + gamma) + beta
+        return out
 
-        return [f_fea64, f_fea128, f_fea256], [s_fea64, s_fea128, s_fea256], [label64, label128, label256], [out1, out2, out3]
 
-    def helper(self, f1, f2, c1, c2, shift):
-        with torch.no_grad():
-            ## norm
-            fd = tensor_correlation(norm(f1), norm(f2))
-            old_mean = fd.mean()
-            fd -= fd.mean([3, 4], keepdim=True)
-            fd = fd - fd.mean() + old_mean
-            
-        cd = tensor_correlation(norm(c1), norm(c2))
-        min_val = 0.0
-        loss = - cd.clamp(min_val) * (fd - shift)
-        return loss
-    
-            
-class D_net(nn.Module):
-    def __init__(self, in_channels, use_sigmoid=True, use_spectral_norm=True, init_weights=True):
-        super(D_net, self).__init__()
-        self.use_sigmoid = use_sigmoid
-
-        self.conv1 = self.features = nn.Sequential(
-            nn.utils.spectral_norm(nn.Conv2d(in_channels=in_channels, out_channels=64, kernel_size=4, stride=2, padding=1, bias=not use_spectral_norm)),
-            nn.LeakyReLU(0.2, inplace=True),
+class ASF(nn.Module):
+    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch):
+        super().__init__()
+        self.N = 3
+        self.enc = nn.Sequential(
+            nn.Conv2d(in_ch1 + in_ch2 + in_ch3, in_ch1 + in_ch2 + in_ch3, kernel_size=3, padding=3 // 2),
+            nn.BatchNorm2d(in_ch1 + in_ch2 + in_ch3, affine=False),
+            nn.ReLU(True),
+            nn.Conv2d(in_ch1 + in_ch2 + in_ch3, out_ch, kernel_size=1, padding=0)
         )
 
-        self.conv2 = nn.Sequential(
-            nn.utils.spectral_norm(nn.Conv2d(in_channels=64, out_channels=128, kernel_size=4, stride=2, padding=1, bias=not use_spectral_norm)),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
+    def forward(self, feat):
+        feat = self.enc(feat)
+        return feat
 
-        self.conv3 = nn.Sequential(
-            nn.utils.spectral_norm(nn.Conv2d(in_channels=128, out_channels=256, kernel_size=4, stride=2, padding=1, bias=not use_spectral_norm)),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
 
-        self.conv4 = nn.Sequential(
-            nn.utils.spectral_norm(nn.Conv2d(in_channels=256, out_channels=512, kernel_size=4, stride=1, padding=1, bias=not use_spectral_norm)),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
+class FH1(nn.Module):
+    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch=256):
+        super().__init__()
 
-        self.conv5 = nn.Sequential(
-            nn.utils.spectral_norm(nn.Conv2d(in_channels=512, out_channels=1, kernel_size=4, stride=1, padding=1, bias=not use_spectral_norm)),
+        self.clusterer1 = nn.Identity()
+        self.clusterer2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.clusterer3 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.MaxPool2d(kernel_size=2, stride=2)
         )
-        
-        self.adversarial_loss = AdversarialLoss('nsgan')
+        self.fus = ASF(in_ch1, in_ch2, in_ch3, out_ch=out_ch)
+
+    def forward(self, feat1, feat2, feat3):
+        code1 = self.clusterer1(feat1)
+        code2 = self.clusterer2(feat2)
+        code3 = self.clusterer3(feat3)
+
+        fused = self.fus(torch.cat((code1, code2, code3), dim=1))
+        return fused
+
+
+class FH2(nn.Module):
+    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch=128):
+        super().__init__()
+
+        self.clusterer1 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.clusterer2 = nn.Identity()
+        self.clusterer3 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.fus = ASF(in_ch1, in_ch2, in_ch3, out_ch=out_ch)
+
+    def forward(self, feat1, feat2, feat3):
+        code1 = self.clusterer1(feat1)
+        code2 = self.clusterer2(feat2)
+        code3 = self.clusterer3(feat3)
+
+        fused = self.fus(torch.cat((code1, code2, code3), dim=1))
+        return fused
+
+
+class FH3(nn.Module):
+    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch=64):
+        super().__init__()
+
+        self.clusterer1 = nn.Upsample(scale_factor=4, mode='nearest')
+        self.clusterer2 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.clusterer3 = nn.Identity()
+
+        self.fus = ASF(in_ch1, in_ch2, in_ch3, out_ch=out_ch)
+
+    def forward(self, feat1, feat2, feat3):
+        code1 = self.clusterer1(feat1)
+        code2 = self.clusterer2(feat2)
+        code3 = self.clusterer3(feat3)
+        fused = self.fus(torch.cat((code1, code2, code3), dim=1))
+        return fused
+
+
+class GateConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, transpose=False):
+        super(GateConv, self).__init__()
+        self.out_channels = out_channels
+        if transpose:
+            self.gate_conv = nn.ConvTranspose2d(in_channels, out_channels * 2,
+                                                kernel_size=kernel_size,
+                                                stride=stride, padding=padding)
+        else:
+            self.gate_conv = nn.Conv2d(in_channels, out_channels * 2,
+                                       kernel_size=kernel_size,
+                                       stride=stride, padding=padding)
 
     def forward(self, x):
-
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        x = self.conv5(x)
-
-        outputs = x
-        if self.use_sigmoid:
-            outputs = torch.sigmoid(x)
-
-        return outputs
+        x = self.gate_conv(x)
+        (x, g) = torch.split(x, self.out_channels, dim=1)
+        return x * torch.sigmoid(g)
 
 
-class AdversarialLoss(nn.Module):
-    """
-    Adversarial loss
-    https://arxiv.org/abs/1711.10337
-    """
+class BAM(nn.Module):
+    def __init__(self, map_dim=256, im_in_dim1=256, im_out_dim=256, use_concat=True, apa_idx=1):
+        super(LAGI, self).__init__()
 
-    def __init__(self, type='nsgan', target_real_label=1.0, target_fake_label=0.0):
-        """
-        type = nsgan | lsgan | hinge
-        """
-        super(AdversarialLoss, self).__init__()
+        self.apa_idx = apa_idx
+        self.use_concat = use_concat
 
-        self.type = type
-        self.register_buffer('real_label', torch.tensor(target_real_label))
-        self.register_buffer('fake_label', torch.tensor(target_fake_label))
+        # high-level (SPADE)
+        self.conv_high1 = nn.Conv2d(map_dim + im_in_dim1, map_dim, 3, dilation=2, padding=2 * (3 // 2))
+        self.spaed_block = SPADE(im_dim1, map_dim)
+        self.conv_high2 = nn.Sequential(
+            nn.Conv2d(in_channels=im_dim1, out_channels=im_out_dim, kernel_size=3, padding=1),
+            nn.ReLU())
 
-        if type == 'nsgan':
-            self.criterion = nn.BCELoss()
+        # low-level (GC)
+        self.conv_low1 = nn.Conv2d(in_channels=map_dim + im_in_dim1, out_channels=1, kernel_size=3, padding=3 // 2)
+        self.conv_low2 = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            GateConv(in_channels=1, out_channels=12, kernel_size=3, stride=1, padding=0),
+            nn.ReLU())
+        self.low_conv3 = nn.Sequential(
+            nn.Conv2d(in_channels=im_in_dim1 + 12, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
+            nn.BatchNorm2d(im_out_dim),
+            nn.ReLU())
 
-        elif type == 'lsgan':
-            self.criterion = nn.MSELoss()
+        # out
+        self.out_conv1 = nn.Sequential(
+            nn.Conv2d(in_channels=im_out_dim + im_out_dim, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
+            nn.InstanceNorm2d(im_out_dim, track_running_stats=False),
+            nn.ReLU())
 
-        elif type == 'hinge':
-            self.criterion = nn.ReLU()
+        self.out_conv2 = nn.Sequential(
+            nn.Conv2d(in_channels=im_out_dim, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
+            nn.InstanceNorm2d(im_out_dim, track_running_stats=False),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=im_out_dim, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
+            nn.InstanceNorm2d(im_out_dim, track_running_stats=False),
+            nn.ReLU()
+        )
 
-    def __call__(self, outputs, is_real, is_disc=None):
-        if self.type == 'hinge':
-            if is_disc:
-                if is_real:
-                    outputs = -outputs
-                return self.criterion(1 + outputs).mean()
+        if apa_idx == 1:
+            self.apa = APA1(3, 3, 3, out_ch=3)
+        elif apa_idx == 2:
+            self.apa = APA2(3, 3, 3, out_ch=3)
+        elif apa_idx == 3:
+            self.apa = APA3(3, 3, 3, out_ch=3)
+
+    def forward(self, x1, x2, rep_c_list):
+        # information fusion
+        map = self.apa(rep_c_list[2], rep_c_list[1], rep_c_list[0])
+
+        # high-level information
+        high_level = self.high_conv1(torch.cat((map, x1), dim=1))
+        high_up_im = self.spaed_block(x1, high_level)
+        high_up_im = self.high_conv2(high_up_im)
+
+        # low-level information
+        low_level = self.conv_low1(torch.cat((map, x1), dim=1))
+        low_up_im = self.low_conv1(low_level)
+        low_up_im = self.low_conv3(torch.cat((low_up_im, x1), dim=1))
+
+        # out
+        out = self.out_conv1(torch.cat((high_up_im, low_up_im), dim=1)) + x2
+        out = self.out_conv2(out)
+        return out
+
+
+def weights_init(init_type='gaussian'):
+    def init_fun(m):
+        classname = m.__class__.__name__
+        if (classname.find('Conv') == 0 or classname.find(
+                'Linear') == 0) and hasattr(m, 'weight'):
+            if init_type == 'gaussian':
+                nn.init.normal_(m.weight, 0.0, 0.02)
+            elif init_type == 'xavier':
+                nn.init.xavier_normal_(m.weight, gain=math.sqrt(2))
+            elif init_type == 'kaiming':
+                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+            elif init_type == 'default':
+                pass
             else:
-                return (-outputs).mean()
+                assert 0, "Unsupported initialization: {}".format(init_type)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+    return init_fun
 
-        else:
-            labels = (self.real_label if is_real else self.fake_label).expand_as(outputs)
-            loss = self.criterion(outputs, labels)
-            return loss
+
+class Bottleneck(nn.Module):
+    expansion = 4
+    def __init__(self, inplanes, planes, stride=1):
+        super().__init__()
+
+        # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
+        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.relu2 = nn.ReLU(inplace=True)
+
+        self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
+
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu3 = nn.ReLU(inplace=True)
+
+        self.downsample = None
+        self.stride = stride
+
+        if stride > 1 or inplanes != planes * Bottleneck.expansion:
+            # downsampling layer is prepended with an avgpool, and the subsequent convolution has stride 1
+            self.downsample = nn.Sequential(OrderedDict([
+                ("-1", nn.AvgPool2d(stride)),
+                ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
+                ("1", nn.BatchNorm2d(planes * self.expansion))
+            ]))
+
+    def forward(self, x: torch.Tensor):
+        identity = x
+
+        out = self.relu1(self.bn1(self.conv1(x)))
+        out = self.relu2(self.bn2(self.conv2(out)))
+        out = self.avgpool(out)
+        out = self.bn3(self.conv3(out))
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu3(out)
+        return out
+
+class Cl_Block(nn.Module):
+    def __init__(self, in_ch, out_ch=3):
+        super().__init__()
+
+        self.clusterer = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, out_ch, (1, 1)))
+
+        self.nonlinear_clusterer = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, in_ch, (1, 1)),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(in_ch, out_ch, (1, 1)))
+
+    def forward(self, image_feat):
+        code = self.clusterer(image_feat)
+        code += self.nonlinear_clusterer(image_feat)
+        return code
