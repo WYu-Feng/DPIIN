@@ -11,7 +11,45 @@ import torchvision.transforms as transforms
 import math
 from timm.models.layers import trunc_normal_
 
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = downsample
+        self.relu = nn.ReLU(inplace=True)
 
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        out = self.relu(out)
+        return out
+
+def Upsample(dim):
+    return nn.Sequential(
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        nn.Conv2d(dim, dim//2, 3, padding=1)
+    )
+
+class Downsample(nn.Module):
+    def __init__(self, n_feat):
+        super(Downsample, self).__init__()
+
+        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat//2, kernel_size=3, stride=1, padding=1, bias=False),
+                                  nn.PixelUnshuffle(2))
+
+    def forward(self, x):
+        return self.body(x)
+    
 class SPADE(nn.Module):
     def __init__(self, norm_nc, label_nc):
         super().__init__()
@@ -34,79 +72,56 @@ class SPADE(nn.Module):
         return out
 
 
-class ASF(nn.Module):
-    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch):
-        super().__init__()
-        self.N = 3
-        self.enc = nn.Sequential(
-            nn.Conv2d(in_ch1 + in_ch2 + in_ch3, in_ch1 + in_ch2 + in_ch3, kernel_size=3, padding=3 // 2),
-            nn.BatchNorm2d(in_ch1 + in_ch2 + in_ch3, affine=False),
-            nn.ReLU(True),
-            nn.Conv2d(in_ch1 + in_ch2 + in_ch3, out_ch, kernel_size=1, padding=0)
+class APA(nn.Module):
+    def __init__(self, in_fea_dim = 64, in_rep_dim = [152, 76, 76], resolution = 152, out_dim = 64):
+        super(APA, self).__init__()
+        self.resolution = resolution
+
+        self.conv11 = nn.Conv2d(in_rep_dim[0], in_fea_dim, 3, padding=3//2)
+        self.conv12 = nn.Sequential(
+            nn.Conv2d(in_fea_dim + in_rep_dim[0], in_fea_dim, 1),
+            nn.GELU()
         )
+        self.conv13 = nn.Conv2d(in_fea_dim, in_fea_dim, 3, padding=3 // 2)
 
-    def forward(self, feat):
-        feat = self.enc(feat)
-        return feat
-
-
-class FH1(nn.Module):
-    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch=256):
-        super().__init__()
-
-        self.clusterer1 = nn.Identity()
-        self.clusterer2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.clusterer3 = nn.Sequential(
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv21 = nn.Conv2d(in_rep_dim[1], in_fea_dim, 3, padding=3//2)
+        self.conv22 = nn.Sequential(
+            nn.Conv2d(in_fea_dim + in_rep_dim[1], in_fea_dim, 1),
+            nn.GELU()
         )
-        self.fus = ASF(in_ch1, in_ch2, in_ch3, out_ch=out_ch)
+        self.conv23 = nn.Conv2d(in_fea_dim, in_fea_dim, 3, padding=3 // 2)
 
-    def forward(self, feat1, feat2, feat3):
-        code1 = self.clusterer1(feat1)
-        code2 = self.clusterer2(feat2)
-        code3 = self.clusterer3(feat3)
+        self.conv31 = nn.Conv2d(in_rep_dim[2], in_fea_dim, 3, padding=3//2)
+        self.conv32 = nn.Sequential(
+            nn.Conv2d(in_fea_dim + in_rep_dim[2], in_fea_dim, 1),
+            nn.GELU()
+        )
+        self.conv33 = nn.Conv2d(in_fea_dim, in_fea_dim, 3, padding=3 // 2)
 
-        fused = self.fus(torch.cat((code1, code2, code3), dim=1))
-        return fused
+        self.out_conv = nn.Conv2d(in_fea_dim + in_fea_dim + in_fea_dim, out_dim, 1)
 
+    def forward(self, x, rep_c_list):
+        p1 = F.interpolate(rep_c_list[0], size = self.resolution, mode='bilinear', align_corners=False)
+        p2 = F.interpolate(rep_c_list[1], size=self.resolution, mode='bilinear', align_corners=False)
+        p3 = F.interpolate(rep_c_list[2], size=self.resolution, mode='bilinear', align_corners=False)
 
-class FH2(nn.Module):
-    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch=128):
-        super().__init__()
+        p1_in = self.conv11(p1)
+        x1 = self.conv12(torch.cat((p1, x), dim = 1))
+        x1 = x1 * p1_in
+        x1 = self.conv13(x1) + p1_in
 
-        self.clusterer1 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.clusterer2 = nn.Identity()
-        self.clusterer3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        p2_in = self.conv21(p2)
+        x2 = self.conv22(torch.cat((p2, x), dim = 1))
+        x2 = x2 * p2_in
+        x2 = self.conv23(x2) + p2_in
 
-        self.fus = ASF(in_ch1, in_ch2, in_ch3, out_ch=out_ch)
+        p3_in = self.conv31(p3)
+        x3 = self.conv32(torch.cat((p3, x), dim = 1))
+        x3 = x3 * p3_in
+        x3 = self.conv33(x3) + p3_in
 
-    def forward(self, feat1, feat2, feat3):
-        code1 = self.clusterer1(feat1)
-        code2 = self.clusterer2(feat2)
-        code3 = self.clusterer3(feat3)
-
-        fused = self.fus(torch.cat((code1, code2, code3), dim=1))
-        return fused
-
-
-class FH3(nn.Module):
-    def __init__(self, in_ch1, in_ch2, in_ch3, out_ch=64):
-        super().__init__()
-
-        self.clusterer1 = nn.Upsample(scale_factor=4, mode='nearest')
-        self.clusterer2 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.clusterer3 = nn.Identity()
-
-        self.fus = ASF(in_ch1, in_ch2, in_ch3, out_ch=out_ch)
-
-    def forward(self, feat1, feat2, feat3):
-        code1 = self.clusterer1(feat1)
-        code2 = self.clusterer2(feat2)
-        code3 = self.clusterer3(feat3)
-        fused = self.fus(torch.cat((code1, code2, code3), dim=1))
-        return fused
-
+        out = self.out_conv(torch.cat((x1, x2, x3), dim = 1))
+        return out
 
 class GateConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, transpose=False):
@@ -126,95 +141,48 @@ class GateConv(nn.Module):
         (x, g) = torch.split(x, self.out_channels, dim=1)
         return x * torch.sigmoid(g)
 
-
 class BAM(nn.Module):
-    def __init__(self, map_dim=256, im_in_dim1=256, im_out_dim=256, use_concat=True, apa_idx=1):
-        super(LAGI, self).__init__()
+    def __init__(self, x1_dim = 64, x2_dim = 64, prior_dim = 152, out_dim = 64, use_concat = True):
+        super(BAM, self).__init__()
 
-        self.apa_idx = apa_idx
         self.use_concat = use_concat
 
-        # high-level (SPADE)
-        self.conv_high1 = nn.Conv2d(map_dim + im_in_dim1, map_dim, 3, dilation=2, padding=2 * (3 // 2))
-        self.spaed_block = SPADE(im_dim1, map_dim)
-        self.conv_high2 = nn.Sequential(
-            nn.Conv2d(in_channels=im_dim1, out_channels=im_out_dim, kernel_size=3, padding=1),
-            nn.ReLU())
+        self.conv1 = nn.Conv2d(x1_dim, x1_dim, 3, padding=3//2)
+        self.conv2 = nn.Conv2d(prior_dim, prior_dim, 3, padding=3 // 2)
 
-        # low-level (GC)
-        self.conv_low1 = nn.Conv2d(in_channels=map_dim + im_in_dim1, out_channels=1, kernel_size=3, padding=3 // 2)
-        self.conv_low2 = nn.Sequential(
+        self.spaed_conv = nn.Conv2d(prior_dim + x1_dim, x1_dim, 3, padding=3//2)
+        self.spaed_block = SPADE(x1_dim, prior_dim)
+
+        self.gated_block = nn.Sequential(
+            nn.Conv2d(prior_dim + x1_dim, x1_dim, 3, padding=3//2),
+            nn.ReLU(),
             nn.ReflectionPad2d(1),
-            GateConv(in_channels=1, out_channels=12, kernel_size=3, stride=1, padding=0),
-            nn.ReLU())
-        self.low_conv3 = nn.Sequential(
-            nn.Conv2d(in_channels=im_in_dim1 + 12, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
-            nn.BatchNorm2d(im_out_dim),
-            nn.ReLU())
+            GateConv(in_channels = x1_dim, out_channels = x1_dim, kernel_size=3, stride=1, padding=0)
+        )
 
         # out
-        self.out_conv1 = nn.Sequential(
-            nn.Conv2d(in_channels=im_out_dim + im_out_dim, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
-            nn.InstanceNorm2d(im_out_dim, track_running_stats=False),
-            nn.ReLU())
-
-        self.out_conv2 = nn.Sequential(
-            nn.Conv2d(in_channels=im_out_dim, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
-            nn.InstanceNorm2d(im_out_dim, track_running_stats=False),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=im_out_dim, out_channels=im_out_dim, kernel_size=3, padding=3 // 2),
-            nn.InstanceNorm2d(im_out_dim, track_running_stats=False),
+        self.reduce_chan = nn.Conv2d(x1_dim + x1_dim + x2_dim, x1_dim, kernel_size=1, bias=False)
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(in_channels = x1_dim, out_channels = out_dim, kernel_size=3, padding=3 // 2),
+            nn.InstanceNorm2d(out_dim, track_running_stats=False),
             nn.ReLU()
         )
 
-        if apa_idx == 1:
-            self.apa = APA1(3, 3, 3, out_ch=3)
-        elif apa_idx == 2:
-            self.apa = APA2(3, 3, 3, out_ch=3)
-        elif apa_idx == 3:
-            self.apa = APA3(3, 3, 3, out_ch=3)
+    def forward(self, x1, x2, priors):
+        prior_ident = priors
+        priors = self.conv2(priors)
+        x1 = self.conv1(x1)
 
-    def forward(self, x1, x2, rep_c_list):
-        # information fusion
-        map = self.apa(rep_c_list[2], rep_c_list[1], rep_c_list[0])
+        spaed_out = self.spaed_block(self.spaed_conv(torch.cat((x1, priors), dim = 1)), priors)
+        gated_out = self.gated_block(torch.cat((x1, priors), dim = 1)))
 
-        # high-level information
-        high_level = self.high_conv1(torch.cat((map, x1), dim=1))
-        high_up_im = self.spaed_block(x1, high_level)
-        high_up_im = self.high_conv2(high_up_im)
+        if self.use_concat:
+            out = self.reduce_chan(torch.cat((spaed_out, gated_out, x2), dim = 1)))
+        else:
+            out = spaed_out + gated_out + x2
 
-        # low-level information
-        low_level = self.conv_low1(torch.cat((map, x1), dim=1))
-        low_up_im = self.low_conv1(low_level)
-        low_up_im = self.low_conv3(torch.cat((low_up_im, x1), dim=1))
-
-        # out
-        out = self.out_conv1(torch.cat((high_up_im, low_up_im), dim=1)) + x2
-        out = self.out_conv2(out)
+        out = self.out_conv(out)
         return out
-
-
-def weights_init(init_type='gaussian'):
-    def init_fun(m):
-        classname = m.__class__.__name__
-        if (classname.find('Conv') == 0 or classname.find(
-                'Linear') == 0) and hasattr(m, 'weight'):
-            if init_type == 'gaussian':
-                nn.init.normal_(m.weight, 0.0, 0.02)
-            elif init_type == 'xavier':
-                nn.init.xavier_normal_(m.weight, gain=math.sqrt(2))
-            elif init_type == 'kaiming':
-                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
-            elif init_type == 'orthogonal':
-                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
-            elif init_type == 'default':
-                pass
-            else:
-                assert 0, "Unsupported initialization: {}".format(init_type)
-            if hasattr(m, 'bias') and m.bias is not None:
-                nn.init.constant_(m.bias, 0.0)
-    return init_fun
-
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -262,19 +230,23 @@ class Bottleneck(nn.Module):
         out = self.relu3(out)
         return out
 
-class Cl_Block(nn.Module):
-    def __init__(self, in_ch, out_ch=3):
-        super().__init__()
-
-        self.clusterer = torch.nn.Sequential(
-            torch.nn.Conv2d(in_ch, out_ch, (1, 1)))
-
-        self.nonlinear_clusterer = torch.nn.Sequential(
-            torch.nn.Conv2d(in_ch, in_ch, (1, 1)),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(in_ch, out_ch, (1, 1)))
-
-    def forward(self, image_feat):
-        code = self.clusterer(image_feat)
-        code += self.nonlinear_clusterer(image_feat)
-        return code
+def weights_init(init_type='gaussian'):
+    def init_fun(m):
+        classname = m.__class__.__name__
+        if (classname.find('Conv') == 0 or classname.find(
+                'Linear') == 0) and hasattr(m, 'weight'):
+            if init_type == 'gaussian':
+                nn.init.normal_(m.weight, 0.0, 0.02)
+            elif init_type == 'xavier':
+                nn.init.xavier_normal_(m.weight, gain=math.sqrt(2))
+            elif init_type == 'kaiming':
+                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+            elif init_type == 'default':
+                pass
+            else:
+                assert 0, "Unsupported initialization: {}".format(init_type)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+    return init_fun
