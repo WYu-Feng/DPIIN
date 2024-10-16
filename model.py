@@ -2,9 +2,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from modules.spatial_transform import LearnableSpatialTransformWrapper
-from modules.networks import Bottleneck, Cl_Block
-
+from networks import ResBlock, Upsample, Downsample
+from networks import BAM, APA
 
 class MAPs_R(nn.Module):
     def __init__(self, layers=(3, 4, 23, 3), output_dim=1024, heads=64 * 32 // 64, input_resolution=512, width=64):
@@ -14,7 +13,7 @@ class MAPs_R(nn.Module):
 
         # self.begin = nn.Conv2d(4, 3, kernel_size=1, stride=1, padding=0, bias=False)
 
-        # the 3-layer stem
+        # the 3-layer stem for Pre-trained Encoder
         self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(width // 2)
         self.relu1 = nn.ReLU(inplace=True)
@@ -35,12 +34,28 @@ class MAPs_R(nn.Module):
 
         embed_dim = width * 32  # the ResNet feature dimension
 
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
-        self.down = nn.Upsample(scale_factor=1 / 2, mode='nearest')
+        # self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        # self.down = nn.Upsample(scale_factor=1 / 2, mode='nearest')
 
-        self.res_b1 = Cl_Block(152)
-        self.res_b2 = Cl_Block(76)
-        self.res_b3 = Cl_Block(76)
+        self.res_b1 = nn.Sequential(
+            nn.Conv2d(152 + 1, 152, kernel_size=1, bias=False),
+            ResBlock(152, 152),
+            ResBlock(152, 152)
+        )
+        self.up1 = Upsample(152)  # 76
+
+        self.res_b2 = nn.Sequential(
+            nn.Conv2d(76 + 76 + 1, 76, kernel_size=1, bias=False),
+            ResBlock(76, 76),
+            ResBlock(76, 76)
+        )
+        self.up2 = Upsample(38)  # 38
+
+        self.res_b3 = nn.Sequential(
+            nn.Conv2d(38 + 76 + 1, 76, kernel_size=1, bias=False),
+            ResBlock(76, 76),
+            ResBlock(76, 76)
+        )
 
     def _make_layer(self, planes, blocks, stride=1):
         layers = [Bottleneck(self._inplanes, planes, stride)]
@@ -51,27 +66,34 @@ class MAPs_R(nn.Module):
         return nn.Sequential(*layers)
 
     def get_fea_list(self, masked):
-        rep_list = list()
+        fea_list = list()
         with torch.no_grad():
             x = masked.type(self.conv1.weight.dtype)
             x = self.relu1(self.bn1(self.conv1(x)))
             x = self.relu2(self.bn2(self.conv2(x)))
             x = self.relu3(self.bn3(self.conv3(x)))
-            rep_list.append(x)
+            fea_list.append(x.detach())
 
             x = self.avgpool(x)
             x = self.layer1(x)
-            rep_list.append(x)
+            fea_list.append(x.detach())
 
             x = self.layer2(x)
-            rep_list.append(x)
-        return rep_list
+            fea_list.append(x.detach())
+        return fea_list
 
-    def get_se_list(self, rep_list):
+    def get_rep_list(self, fea_list, mask_list):
         rep_c_list = list()
-        rep_c_list.append(self.res_b1(rep_list[0]))
-        rep_c_list.append(self.res_b2(rep_list[1]))
-        rep_c_list.append(self.res_b3(rep_list[2]))
+        x = self.res_b1(torch.cat((fea_list[0], mask_list[0]), dim = 1))
+        self.res_b1(x)
+
+        x = self.up1(x)
+        x = self.res_b2(torch.cat((x, fea_list[1], mask_list[1]), dim=1))
+        rep_c_list.append(x)
+
+        x = self.up2(x)
+        x = self.res_b3(torch.cat((x, fea_list[2], mask_list[2]), dim=1))
+        rep_c_list.append(x)
         return rep_c_list
 
     def forward(self, x):
@@ -102,15 +124,19 @@ class MAPs_IN(nn.Module):
         )
 
         blocks = []
-        for i in range(8):
+        for i in range(4):
             cur_resblock = Bottleneck(ngf*4, ngf*4)
             blocks.append(cur_resblock)
         self.middle = nn.Sequential(*blocks)
 
         self.up = nn.Upsample(scale_factor=2)
-        self.decoder1 = BAM(se_dim = 3, im_dim1 = ngf*4, im_dim2 = ngf*4, im_out_dim = ngf*4, use_concat = True, se_idx = 1)  # in = 32, out = 64
-        self.decoder2 = BAM(se_dim = 3, im_dim1 = ngf*4, im_dim2 = ngf*2, im_out_dim = ngf*2, use_concat = True, se_idx = 2)  # in = 64, out = 128
-        self.decoder3 = BAM(se_dim = 3, im_dim1 = ngf*2, im_dim2 = ngf, im_out_dim = ngf, use_concat = True, se_idx = 3)  # in = 128, out = 256
+        self.decoder1 = BAM(x1_dim = ngf*4, x2_dim = ngf*4, prior_dim = 152, im_out_dim = ngf*4, use_concat = True)  # in = 32, out = 64
+        self.decoder2 = BAM(x1_dim = ngf*2, x2_dim = ngf*2, prior_dim = 76, im_out_dim = ngf*2, use_concat = True)  # in = 64, out = 128
+        self.decoder3 = BAM(x1_dim = ngf, x2_dim = ngf, prior_dim = 76, im_out_dim = ngf, use_concat = True)  # in = 128, out = 256
+
+        self.apa1 = APA(in_fea_dim = ngf*4, in_rep_dim = [152, 76, 76], resolution = 64, out_dim = ngf*4)
+        self.apa2 = APA(in_fea_dim = ngf*4, in_rep_dim = [152, 76, 76], resolution = 128, out_dim = ngf*4)
+        self.apa3 = APA(in_fea_dim = ngf*2, in_rep_dim = [152, 76, 76], resolution = 256, out_dim = ngf*2)
 
         self.out = nn.Sequential(
             nn.ReflectionPad2d(3),
@@ -126,18 +152,22 @@ class MAPs_IN(nn.Module):
         inputs_list.append(inputs)
 
         inputs = self.encoder3(inputs)
-        x = inputs
+        inputs_list.append(inputs)
 
-        for i in range(8):
+        x = inputs
+        for i in range(4):
             x = self.middle[i](x)
 
-        x = self.decoder1(x1=x, x2=inputs, rep_c_list=rep_c_list)
-
+        p1 = self.apa1(x, rep_c_list)
+        x = self.decoder1(x1=x, x2=inputs_list[-1], priors = p1)
         x = self.up(x)
-        x = self.decoder2(x1=x, x2=inputs_list[-1], rep_c_list=rep_c_list)
 
+        p2 = self.apa2(x, rep_c_list)
+        x = self.decoder2(x1=x, x2=inputs_list[-2], priors = p2)
         x = self.up(x)
-        x = self.decoder3(x1=x, x2=inputs_list[-2], rep_c_list=rep_c_list)
+
+        p3 = self.apa3(x, rep_c_list)
+        x = self.decoder3(x1=x, x2=inputs_list[-3], priors = p3)
 
         x = self.out(x)
         x = (torch.tanh(x) + 1) / 2
