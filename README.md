@@ -1,5 +1,5 @@
-Official "Image Inpainting via Multi-scale Adaptive Priors" code implemented with pytorch.
-The pretrained models for datasets CelebA [liu2015deep], Places2 [zhou2017places], and Paris StreetView [doersch2015makes] under irregular masks [liu2018image] are available in "checkpoints". You can directly load and test them.
+**Official "Image Inpainting via Multi-scale Adaptive Priors" code implemented with pytorch.
+The pretrained models for datasets CelebA [liu2015deep], Places2 [zhou2017places], and Paris StreetView [doersch2015makes] under irregular masks [liu2018image] are available in "checkpoints". You can directly load and test them.**
 
 @inproceedings{liu2015deep,
   title={Deep learning face attributes in the wild},
