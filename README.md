@@ -1,7 +1,7 @@
 **Official "Image Inpainting via Multi-scale Adaptive Priors" code implemented with pytorch.
 The pretrained models for datasets CelebA [liu2015deep], Places2 [zhou2017places], and Paris StreetView [doersch2015makes] under irregular masks [liu2018image] are available in "[drive.google](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing)". You can directly load and test them.**
 
-*@inproceedings{liu2015deep,
+@inproceedings{liu2015deep,
   title={Deep learning face attributes in the wild},
   author={Liu, Ziwei and Luo, Ping and Wang, Xiaogang and Tang, Xiaoou},
   booktitle={Proceedings of the IEEE international conference on computer vision},
@@ -37,9 +37,9 @@ The pretrained models for datasets CelebA [liu2015deep], Places2 [zhou2017places
   booktitle={Proceedings of the European conference on computer vision (ECCV)},
   pages={85--100},
   year={2018}
-}*
+}
 
-** In our comparative experiments, certain methods did not provide official pretrained models for the given dataset and mask type. To ensure a fair comparison, we retrained these models based on the officially stated training pipelines under our experimental setup. We have also released the retrained weights, their are: **
+**In our comparative experiments, certain methods did not provide official pretrained models for the given dataset and mask type. To ensure a fair comparison, we retrained these models based on the officially stated training pipelines under our experimental setup. We have also released the retrained weights, their are**: 
 
 MI-GAN in Paris StreetView: 
 
