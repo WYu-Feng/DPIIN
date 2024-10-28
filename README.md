@@ -1,5 +1,5 @@
 **Official "Image Inpainting via Multi-scale Adaptive Priors" code implemented with pytorch.
-The pretrained models for datasets CelebA [liu2015deep], Places2 [zhou2017places], and Paris StreetView [doersch2015makes] under irregular masks [liu2018image] are available in "[Google Drive](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing)". You can directly load and test them.**
+The pretrained models for datasets CelebA [liu2015deep], Places2 [zhou2017places], and Paris StreetView [doersch2015makes] under irregular masks [liu2018image] are available in [Google Drive](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing). You can directly load and test them.**
 
 @inproceedings{liu2015deep,
   title={Deep learning face attributes in the wild},
@@ -41,11 +41,11 @@ The pretrained models for datasets CelebA [liu2015deep], Places2 [zhou2017places
 
 **In our comparative experiments, certain methods did not provide official pretrained models for the given dataset and mask type. To ensure a fair comparison, we retrained these models based on the officially stated training pipelines under our experimental setup. We have also released the retrained weights, their are**: 
 
-MI-GAN in Paris StreetView: "[Google Drive]([https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing](https://drive.google.com/drive/folders/1o9BkRxIEFfrkP2cCAqA2qPHD_02XmBvP))"
+MI-GAN in Paris StreetView: [Google Drive](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing)
 
-MI-GAN in Places2: "[Google Drive]([https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing](https://drive.google.com/drive/folders/1o9BkRxIEFfrkP2cCAqA2qPHD_02XmBvP))"
+MI-GAN in Places2: [Google Drive](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing)
 
-MI-GAN in CelebA: "[Google Drive]([https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing](https://drive.google.com/drive/folders/1o9BkRxIEFfrkP2cCAqA2qPHD_02XmBvP))"
+MI-GAN in CelebA: [Google Drive](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing)
 
-MISF in Paris StreetView: "[Google Drive]([https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing](https://drive.google.com/drive/folders/1o9BkRxIEFfrkP2cCAqA2qPHD_02XmBvP))"
+MISF in Paris StreetView: [Google Drive](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing)
 
