@@ -49,3 +49,5 @@ MI-GAN in CelebA: [Google Drive](https://drive.google.com/drive/folders/1cZ2E5uz
 
 MISF in Paris StreetView: [Google Drive](https://drive.google.com/drive/folders/1cZ2E5uzGqDp5X0ICphewGVbP4kwMlsxj?usp=sharing)
 
+**To explore the performance of our method at higher mask ratios, following the MI-GAN setup, we generated additional random masks covering mask ratios from 0% to 99% and retrained MISF, CTSDG, and our method on the Places2 dataset using these generated masks. The retrained weights are: [Google Drive](https://drive.google.com/drive/folders/1-k9Q43UVIePsAtJtyOPOIlQ6vqNgID1C). 
+Additionally, we released two testing mask datasets with mask ratios of 60-80% and 80-99% [Google Drive](https://drive.google.com/drive/folders/12ljjGilcAEQCRrdv4MhXrHMyh4XlpQI1).**
